@@ -89,6 +89,7 @@ catkin_package(
         tf2_ros
         visualization_msgs
         voxel_grid
+        pedsim_msgs
     DEPENDS
         EIGEN3
         Boost
