@@ -95,6 +95,8 @@ namespace base_local_planner {
       g_plan_pub_ = private_nh.advertise<nav_msgs::Path>("global_plan", 1);
       l_plan_pub_ = private_nh.advertise<nav_msgs::Path>("local_plan", 1);
 
+      ros::NodeHandle gn;
+      cmd_vel_sub = gn.subscribe<geometry_msgs::Twist>( "/rto/learned_cmd_vel", 1, [this](auto& msg){ cmdVelCB(msg); });
 
       tf_ = tf;
       costmap_ros_ = costmap_ros;
@@ -272,6 +274,17 @@ namespace base_local_planner {
     }
   }
 
+  void TrajectoryPlannerROS::cmdVelCB(const geometry_msgs::Twist::ConstPtr & cmdVelMsg)
+  {
+    ROS_INFO_STREAM("[TrajectoryPlannerROS::cmdVelCB]");
+    ROS_INFO_STREAM("     cmdVelMsg: " << *cmdVelMsg);
+
+    cmd_vel_msg = *cmdVelMsg;
+    // ROS_INFO_STREAM("     cmd_vel_msg: " << cmd_vel_msg);
+
+  }
+
+
   std::vector<double> TrajectoryPlannerROS::loadYVels(ros::NodeHandle node){
     std::vector<double> y_vels;
 
@@ -397,187 +410,196 @@ namespace base_local_planner {
   }
 
   bool TrajectoryPlannerROS::computeVelocityCommands(geometry_msgs::Twist& cmd_vel){
+    // ROS_INFO_STREAM("TrajectoryPlannerROS::computeVelocityCommands");    
+
     if (! isInitialized()) {
       ROS_ERROR("This planner has not been initialized, please call initialize() before using this planner");
       return false;
     }
 
-    std::vector<geometry_msgs::PoseStamped> local_plan;
-    geometry_msgs::PoseStamped global_pose;
-    if (!costmap_ros_->getRobotPose(global_pose)) {
-      return false;
-    }
+    cmd_vel = cmd_vel_msg;
 
-    std::vector<geometry_msgs::PoseStamped> transformed_plan;
-    //get the global plan in our frame
-    if (!transformGlobalPlan(*tf_, global_plan_, global_pose, *costmap_, global_frame_, transformed_plan)) {
-      ROS_WARN("Could not transform the global plan to the frame of the controller");
-      return false;
-    }
+    // ROS_INFO_STREAM("   cmd_vel: " << cmd_vel);    
 
-    //now we'll prune the plan based on the position of the robot
-    if(prune_plan_)
-      prunePlan(global_pose, transformed_plan, global_plan_);
 
-    geometry_msgs::PoseStamped drive_cmds;
-    drive_cmds.header.frame_id = robot_base_frame_;
-
-    geometry_msgs::PoseStamped robot_vel;
-    odom_helper_.getRobotVel(robot_vel);
-
-    /* For timing uncomment
-    struct timeval start, end;
-    double start_t, end_t, t_diff;
-    gettimeofday(&start, NULL);
-    */
-
-    //if the global plan passed in is empty... we won't do anything
-    if(transformed_plan.empty())
-      return false;
-
-    const geometry_msgs::PoseStamped& goal_point = transformed_plan.back();
-    //we assume the global goal is the last point in the global plan
-    const double goal_x = goal_point.pose.position.x;
-    const double goal_y = goal_point.pose.position.y;
-
-    const double yaw = tf2::getYaw(goal_point.pose.orientation);
-
-    double goal_th = yaw;
-
-    //check to see if we've reached the goal position
-    if (xy_tolerance_latch_ || (getGoalPositionDistance(global_pose, goal_x, goal_y) <= xy_goal_tolerance_)) {
-
-      //if the user wants to latch goal tolerance, if we ever reach the goal location, we'll
-      //just rotate in place
-      if (latch_xy_goal_tolerance_) {
-        xy_tolerance_latch_ = true;
-      }
-
-      double angle = getGoalOrientationAngleDifference(global_pose, goal_th);
-      //check to see if the goal orientation has been reached
-      if (fabs(angle) <= yaw_goal_tolerance_) {
-        //set the velocity command to zero
-        cmd_vel.linear.x = 0.0;
-        cmd_vel.linear.y = 0.0;
-        cmd_vel.angular.z = 0.0;
-        rotating_to_goal_ = false;
-        xy_tolerance_latch_ = false;
-        reached_goal_ = true;
-      } else {
-        //we need to call the next two lines to make sure that the trajectory
-        //planner updates its path distance and goal distance grids
-        tc_->updatePlan(transformed_plan);
-        Trajectory path = tc_->findBestPath(global_pose, robot_vel, drive_cmds);
-        map_viz_.publishCostCloud(costmap_);
-
-        //copy over the odometry information
-        nav_msgs::Odometry base_odom;
-        odom_helper_.getOdom(base_odom);
-
-        //if we're not stopped yet... we want to stop... taking into account the acceleration limits of the robot
-        if ( ! rotating_to_goal_ && !base_local_planner::stopped(base_odom, rot_stopped_velocity_, trans_stopped_velocity_)) {
-          if ( ! stopWithAccLimits(global_pose, robot_vel, cmd_vel)) {
-            return false;
-          }
-        }
-        //if we're stopped... then we want to rotate to goal
-        else{
-          //set this so that we know its OK to be moving
-          rotating_to_goal_ = true;
-          if(!rotateToGoal(global_pose, robot_vel, goal_th, cmd_vel)) {
-            return false;
-          }
-        }
-      }
-
-      //publish an empty plan because we've reached our goal position
-      publishPlan(transformed_plan, g_plan_pub_);
-      publishPlan(local_plan, l_plan_pub_);
-
-      //we don't actually want to run the controller when we're just rotating to goal
-      return true;
-    }
-
-    tc_->updatePlan(transformed_plan);
-
-    //compute what trajectory to drive along
-    Trajectory path = tc_->findBestPath(global_pose, robot_vel, drive_cmds);
-
-    map_viz_.publishCostCloud(costmap_);
-    /* For timing uncomment
-    gettimeofday(&end, NULL);
-    start_t = start.tv_sec + double(start.tv_usec) / 1e6;
-    end_t = end.tv_sec + double(end.tv_usec) / 1e6;
-    t_diff = end_t - start_t;
-    ROS_INFO("Cycle time: %.9f", t_diff);
-    */
-
-    //pass along drive commands
-    cmd_vel.linear.x = drive_cmds.pose.position.x;
-    cmd_vel.linear.y = drive_cmds.pose.position.y;
-    cmd_vel.angular.z = tf2::getYaw(drive_cmds.pose.orientation);
-
-    //if we cannot move... tell someone
-    if (path.cost_ < 0) {
-      ROS_DEBUG_NAMED("trajectory_planner_ros",
-          "The rollout planner failed to find a valid plan. This means that the footprint of the robot was in collision for all simulated trajectories.");
-      local_plan.clear();
-      publishPlan(transformed_plan, g_plan_pub_);
-      publishPlan(local_plan, l_plan_pub_);
-      return false;
-    }
-
-    ROS_DEBUG_NAMED("trajectory_planner_ros", "A valid velocity command of (%.2f, %.2f, %.2f) was found for this cycle.",
-        cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.angular.z);
-
-    // Fill out the local plan
-    for (unsigned int i = 0; i < path.getPointsSize(); ++i) {
-      double p_x, p_y, p_th;
-      path.getPoint(i, p_x, p_y, p_th);
-      geometry_msgs::PoseStamped pose;
-      pose.header.frame_id = global_frame_;
-      pose.header.stamp = ros::Time::now();
-      pose.pose.position.x = p_x;
-      pose.pose.position.y = p_y;
-      pose.pose.position.z = 0.0;
-      tf2::Quaternion q;
-      q.setRPY(0, 0, p_th);
-      tf2::convert(q, pose.pose.orientation);
-      local_plan.push_back(pose);
-    }
-
-    //publish information to the visualizer
-    publishPlan(transformed_plan, g_plan_pub_);
-    publishPlan(local_plan, l_plan_pub_);
     return true;
-  }
 
-  bool TrajectoryPlannerROS::checkTrajectory(double vx_samp, double vy_samp, double vtheta_samp, bool update_map){
-    geometry_msgs::PoseStamped global_pose;
-    if(costmap_ros_->getRobotPose(global_pose)){
-      if(update_map){
-        //we need to give the planne some sort of global plan, since we're only checking for legality
-        //we'll just give the robots current position
-        std::vector<geometry_msgs::PoseStamped> plan;
-        plan.push_back(global_pose);
-        tc_->updatePlan(plan, true);
-      }
+  //   std::vector<geometry_msgs::PoseStamped> local_plan;
+  //   geometry_msgs::PoseStamped global_pose;
+  //   if (!costmap_ros_->getRobotPose(global_pose)) {
+  //     return false;
+  //   }
 
-      //copy over the odometry information
-      nav_msgs::Odometry base_odom;
-      {
-        boost::recursive_mutex::scoped_lock lock(odom_lock_);
-        base_odom = base_odom_;
-      }
+  //   std::vector<geometry_msgs::PoseStamped> transformed_plan;
+  //   //get the global plan in our frame
+  //   if (!transformGlobalPlan(*tf_, global_plan_, global_pose, *costmap_, global_frame_, transformed_plan)) {
+  //     ROS_WARN("Could not transform the global plan to the frame of the controller");
+  //     return false;
+  //   }
 
-      return tc_->checkTrajectory(global_pose.pose.position.x, global_pose.pose.position.y, tf2::getYaw(global_pose.pose.orientation),
-          base_odom.twist.twist.linear.x,
-          base_odom.twist.twist.linear.y,
-          base_odom.twist.twist.angular.z, vx_samp, vy_samp, vtheta_samp);
+  //   //now we'll prune the plan based on the position of the robot
+  //   if(prune_plan_)
+  //     prunePlan(global_pose, transformed_plan, global_plan_);
 
-    }
-    ROS_WARN("Failed to get the pose of the robot. No trajectories will pass as legal in this case.");
-    return false;
+  //   geometry_msgs::PoseStamped drive_cmds;
+  //   drive_cmds.header.frame_id = robot_base_frame_;
+
+  //   geometry_msgs::PoseStamped robot_vel;
+  //   odom_helper_.getRobotVel(robot_vel);
+
+  //   /* For timing uncomment
+  //   struct timeval start, end;
+  //   double start_t, end_t, t_diff;
+  //   gettimeofday(&start, NULL);
+  //   */
+
+  //   //if the global plan passed in is empty... we won't do anything
+  //   if(transformed_plan.empty())
+  //     return false;
+
+  //   const geometry_msgs::PoseStamped& goal_point = transformed_plan.back();
+  //   //we assume the global goal is the last point in the global plan
+  //   const double goal_x = goal_point.pose.position.x;
+  //   const double goal_y = goal_point.pose.position.y;
+
+  //   const double yaw = tf2::getYaw(goal_point.pose.orientation);
+
+  //   double goal_th = yaw;
+
+  //   //check to see if we've reached the goal position
+  //   if (xy_tolerance_latch_ || (getGoalPositionDistance(global_pose, goal_x, goal_y) <= xy_goal_tolerance_)) {
+
+  //     //if the user wants to latch goal tolerance, if we ever reach the goal location, we'll
+  //     //just rotate in place
+  //     if (latch_xy_goal_tolerance_) {
+  //       xy_tolerance_latch_ = true;
+  //     }
+
+  //     double angle = getGoalOrientationAngleDifference(global_pose, goal_th);
+  //     //check to see if the goal orientation has been reached
+  //     if (fabs(angle) <= yaw_goal_tolerance_) {
+  //       //set the velocity command to zero
+  //       cmd_vel.linear.x = 0.0;
+  //       cmd_vel.linear.y = 0.0;
+  //       cmd_vel.angular.z = 0.0;
+  //       rotating_to_goal_ = false;
+  //       xy_tolerance_latch_ = false;
+  //       reached_goal_ = true;
+  //     } else {
+  //       //we need to call the next two lines to make sure that the trajectory
+  //       //planner updates its path distance and goal distance grids
+  //       tc_->updatePlan(transformed_plan);
+  //       Trajectory path = tc_->findBestPath(global_pose, robot_vel, drive_cmds);
+  //       map_viz_.publishCostCloud(costmap_);
+
+  //       //copy over the odometry information
+  //       nav_msgs::Odometry base_odom;
+  //       odom_helper_.getOdom(base_odom);
+
+  //       //if we're not stopped yet... we want to stop... taking into account the acceleration limits of the robot
+  //       if ( ! rotating_to_goal_ && !base_local_planner::stopped(base_odom, rot_stopped_velocity_, trans_stopped_velocity_)) {
+  //         if ( ! stopWithAccLimits(global_pose, robot_vel, cmd_vel)) {
+  //           return false;
+  //         }
+  //       }
+  //       //if we're stopped... then we want to rotate to goal
+  //       else{
+  //         //set this so that we know its OK to be moving
+  //         rotating_to_goal_ = true;
+  //         if(!rotateToGoal(global_pose, robot_vel, goal_th, cmd_vel)) {
+  //           return false;
+  //         }
+  //       }
+  //     }
+
+  //     //publish an empty plan because we've reached our goal position
+  //     publishPlan(transformed_plan, g_plan_pub_);
+  //     publishPlan(local_plan, l_plan_pub_);
+
+  //     //we don't actually want to run the controller when we're just rotating to goal
+  //     return true;
+  //   }
+
+  //   tc_->updatePlan(transformed_plan);
+
+  //   //compute what trajectory to drive along
+  //   Trajectory path = tc_->findBestPath(global_pose, robot_vel, drive_cmds);
+
+  //   map_viz_.publishCostCloud(costmap_);
+  //   /* For timing uncomment
+  //   gettimeofday(&end, NULL);
+  //   start_t = start.tv_sec + double(start.tv_usec) / 1e6;
+  //   end_t = end.tv_sec + double(end.tv_usec) / 1e6;
+  //   t_diff = end_t - start_t;
+  //   ROS_INFO("Cycle time: %.9f", t_diff);
+  //   */
+
+  //   //pass along drive commands
+  //   cmd_vel.linear.x = drive_cmds.pose.position.x;
+  //   cmd_vel.linear.y = drive_cmds.pose.position.y;
+  //   cmd_vel.angular.z = tf2::getYaw(drive_cmds.pose.orientation);
+
+  //   //if we cannot move... tell someone
+  //   if (path.cost_ < 0) {
+  //     ROS_DEBUG_NAMED("trajectory_planner_ros",
+  //         "The rollout planner failed to find a valid plan. This means that the footprint of the robot was in collision for all simulated trajectories.");
+  //     local_plan.clear();
+  //     publishPlan(transformed_plan, g_plan_pub_);
+  //     publishPlan(local_plan, l_plan_pub_);
+  //     return false;
+  //   }
+
+  //   ROS_DEBUG_NAMED("trajectory_planner_ros", "A valid velocity command of (%.2f, %.2f, %.2f) was found for this cycle.",
+  //       cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.angular.z);
+
+  //   // Fill out the local plan
+  //   for (unsigned int i = 0; i < path.getPointsSize(); ++i) {
+  //     double p_x, p_y, p_th;
+  //     path.getPoint(i, p_x, p_y, p_th);
+  //     geometry_msgs::PoseStamped pose;
+  //     pose.header.frame_id = global_frame_;
+  //     pose.header.stamp = ros::Time::now();
+  //     pose.pose.position.x = p_x;
+  //     pose.pose.position.y = p_y;
+  //     pose.pose.position.z = 0.0;
+  //     tf2::Quaternion q;
+  //     q.setRPY(0, 0, p_th);
+  //     tf2::convert(q, pose.pose.orientation);
+  //     local_plan.push_back(pose);
+  //   }
+
+  //   //publish information to the visualizer
+  //   publishPlan(transformed_plan, g_plan_pub_);
+  //   publishPlan(local_plan, l_plan_pub_);
+  //   return true;
+  // }
+
+  // bool TrajectoryPlannerROS::checkTrajectory(double vx_samp, double vy_samp, double vtheta_samp, bool update_map){
+  //   geometry_msgs::PoseStamped global_pose;
+  //   if(costmap_ros_->getRobotPose(global_pose)){
+  //     if(update_map){
+  //       //we need to give the planne some sort of global plan, since we're only checking for legality
+  //       //we'll just give the robots current position
+  //       std::vector<geometry_msgs::PoseStamped> plan;
+  //       plan.push_back(global_pose);
+  //       tc_->updatePlan(plan, true);
+  //     }
+
+  //     //copy over the odometry information
+  //     nav_msgs::Odometry base_odom;
+  //     {
+  //       boost::recursive_mutex::scoped_lock lock(odom_lock_);
+  //       base_odom = base_odom_;
+  //     }
+
+  //     return tc_->checkTrajectory(global_pose.pose.position.x, global_pose.pose.position.y, tf2::getYaw(global_pose.pose.orientation),
+  //         base_odom.twist.twist.linear.x,
+  //         base_odom.twist.twist.linear.y,
+  //         base_odom.twist.twist.angular.z, vx_samp, vy_samp, vtheta_samp);
+
+  //   }
+  //   ROS_WARN("Failed to get the pose of the robot. No trajectories will pass as legal in this case.");
+  //   return false;
   }
 
 

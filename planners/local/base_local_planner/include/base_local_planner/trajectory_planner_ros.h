@@ -191,6 +191,8 @@ namespace base_local_planner {
         return x < 0.0 ? -1.0 : 1.0;
       }
 
+      void cmdVelCB(const geometry_msgs::Twist::ConstPtr & cmdVelMsg);
+
       WorldModel* world_model_; ///< @brief The world model that the controller will use
       TrajectoryPlanner* tc_; ///< @brief The trajectory controller
 
@@ -216,6 +218,9 @@ namespace base_local_planner {
       bool latch_xy_goal_tolerance_, xy_tolerance_latch_;
 
       ros::Publisher g_plan_pub_, l_plan_pub_;
+
+      ros::Subscriber cmd_vel_sub;
+      geometry_msgs::Twist cmd_vel_msg;
 
       dynamic_reconfigure::Server<BaseLocalPlannerConfig> *dsrv_;
       base_local_planner::BaseLocalPlannerConfig default_config_;
